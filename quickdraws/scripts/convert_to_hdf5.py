@@ -61,16 +61,17 @@ def get_geno_covar_effect(bed, sample_indices, covars, snp_mask, chunk_size=512,
     if covars is None:
         covars = np.ones((len(sample_indices), 1), dtype='float64')
     else:
-        df_covar = pd.read_csv(covars, sep=r'\s+')
+        df_covar = pd.read_csv(covars, sep=r'\s+', dtype={'FID': str, 'IID': str})
         df_covar = pd.merge(
-            pd.DataFrame(snp_on_disk.iid[:, 0].astype("int"), columns=["FID"]),
+            pd.DataFrame(snp_on_disk.iid[:, 0], columns=["FID"]),
             df_covar,
             on=["FID"],
         )
+        df_covar = df_covar[df_covar.columns[2:]]
         df_covar = df_covar.loc[:, df_covar.std() > 0]
         df_covar["ALL_CONST"] = 1
         df_covar = df_covar.fillna(df_covar.median())
-        covars = df_covar[df_covar.columns[2:]].values
+        covars = df_covar.values
     
     K = np.linalg.inv(covars.T @ covars)
 
@@ -104,8 +105,8 @@ def convert_to_hdf5(
     h1 = h5py.File(out + ".hdf5", 'w') ###caution
 
     ## handle phenotypes here
-    pheno = pd.read_csv(out + ".traits", sep=r'\s+')
-    covareffect = pd.read_csv(out + ".covar_effects", sep=r'\s+')
+    pheno = pd.read_csv(out + ".traits", sep=r'\s+', dtype={'FID': str, 'IID': str})
+    covareffect = pd.read_csv(out + ".covar_effects", sep=r'\s+', dtype={'FID': str, 'IID': str})
     snp_on_disk = Bed(bed, count_A1=True)
 
     ##Count total SNPs
@@ -143,7 +144,7 @@ def convert_to_hdf5(
             master_hdf5 = None
         
 
-    chunk_size = min(chunk_size, snp_on_disk.shape[0])
+    chunk_size = min(chunk_size, len(sample_indices))
 
     logging.info("Estimating variance per allele...")
 
@@ -181,7 +182,7 @@ def convert_to_hdf5(
     dset55 = h1.create_dataset("covars", data=covars_arr, dtype=float)
     dset6 = h1.create_dataset("sample_indices", data=sample_indices, dtype=int)
     dset7 = h1.create_dataset(
-        "iid", data=np.array(snp_on_disk.iid[sample_indices], dtype=int), dtype="int"
+        "iid", data=snp_on_disk.iid[sample_indices].astype('S')
     )
 
     logging.info("Saving the genotype to HDF5 file...")

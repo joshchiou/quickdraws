@@ -264,7 +264,7 @@ def runRHE(
         table.to_csv(out + ".random.annot", header=None, index=None, sep=" ")
         annotation = out + ".random.annot"
 
-    N_phen = pd.read_csv(pheno, sep=r'\s+').shape[1] - 2
+    N_phen = pd.read_csv(pheno, sep=r'\s+', dtype={'FID': str, 'IID': str}).shape[1] - 2
 
     if random_vectors < N_phen:
         logging.exception("Supply more random vectors than the phenotypes being analyzed")
@@ -274,8 +274,8 @@ def runRHE(
     if True:
         cmd = " -g " + bedfile + " -p " + pheno + " -annot " + annotation
         if covariates is not None:
-            pheno_df = pd.read_csv(pheno, sep=r'\s+')
-            covariates_df = pd.read_csv(covariates, sep=r'\s+')
+            pheno_df = pd.read_csv(pheno, sep=r'\s+', dtype={'FID': str, 'IID': str})
+            covariates_df = pd.read_csv(covariates, sep=r'\s+', dtype={'FID': str, 'IID': str})
             covar_df_cols = covariates_df.columns.tolist()
             covariates_df = pd.merge(covariates_df, pheno_df)[covar_df_cols]
             covariates_df.to_csv(out + ".rhe.covars", sep="\t", index=None, na_rep="NA")
@@ -302,7 +302,7 @@ def runRHE(
 
         if binary:
             ## transform heritability from observed scale to liability scale
-            pheno_df = pd.read_csv(pheno, sep=r'\s+')
+            pheno_df = pd.read_csv(pheno, sep=r'\s+', dtype={'FID': str, 'IID': str})
             for pheno in range(len(VC)):
                 prev = pheno_df.values[:, 2 + pheno].mean()
                 z = norm.pdf(norm.ppf(1 - prev))

@@ -418,6 +418,7 @@ def main():
             sep=r'\s+',
             header=None,
             names=["CHR", "SNP", "GENPOS", "POS", "A1", "A2"],
+            dtype={"SNP":str}
         )
         bim = bim[['CHR','SNP','A1','A2']]
         df = pd.merge(df, bim, on=['CHR','SNP'])
