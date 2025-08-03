@@ -331,7 +331,7 @@ class HDF5Dataset:
         ).float()
         self.num_snps = len(self.std_genotype)
         self.chr = torch.as_tensor(np.array(self.h5py_file["chr"])).float()
-        self.iid = np.array(self.h5py_file["iid"], dtype=int)
+        self.iid = np.array(self.h5py_file["iid"], dtype=str)
         self.length = len(self.output)
         self.pheno_names = [p.decode() for p in self.h5py_file['pheno_names']]
         if not lowmem:
@@ -703,7 +703,7 @@ class Trainer:
                 df = pd.DataFrame(loco_estimates[:,:, d])
                 df.columns = self.df_iid_fid.values
                 df_concat = pd.concat(
-                    [pd.DataFrame(columns=['FID_IID'], data = self.unique_chr_map).astype('int'), df], axis=1
+                    [pd.DataFrame(columns=['FID_IID'], data = self.unique_chr_map), df], axis=1
                 )
                 pd.DataFrame(df_concat).to_csv(
                     out + "_" + str(d+1) + ".loco", sep=" ", index=None
@@ -1398,7 +1398,7 @@ def blr_spike_slab(args, h2, hdf5_filename, device="cuda"):
 
     ## Calculate correction for relatives
     if args.kinship is not None:
-        kinship = pd.read_csv(args.kinship, sep='\s+')
+        kinship = pd.read_csv(args.kinship, sep=r'\s+', dtype={'ID1': str, 'ID2': str})
         h2 = h2.numpy()
         if args.binary:
             ## convert from liability to observed scale

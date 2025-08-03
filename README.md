@@ -92,6 +92,11 @@ Loya et al., "A scalable variational inference approach for increased mixed-mode
 
 ## Release Notes
 
+### v0.1.5 (2025-08-03)
+
+- Pandas bug fixes in summary statistics calculation with sample_weights option
+- Supports non integer FID/IID sample names now
+
 ### v0.1.4 (2025-03-27)
 
 - Bug fix, introduced --chunksize argument in quickdraws-step-1 aswell

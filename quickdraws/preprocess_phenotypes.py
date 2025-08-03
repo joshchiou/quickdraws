@@ -41,15 +41,15 @@ def preprocess_phenotypes(pheno, covar, bed, keepfile, binary, hdf5=None, phen_t
         h5_file.close()
 
     snp_on_disk = Bed(bed, count_A1=True)
-    samples_geno = [int(x) for x in snp_on_disk.iid[:, 0]]
+    samples_geno = snp_on_disk.iid[:, 0].tolist()
 
     if keepfile is not None:
         keep_samples = pd.read_csv(keepfile, sep=r'\s+')
-        keep_samples = [int(x) for x in keep_samples[keep_samples.columns[0]]]
+        keep_samples = keep_samples[keep_samples.columns[0]].astype(str).values.tolist()
         samples_geno = list(np.intersect1d(samples_geno, keep_samples))
 
     # Phenotype loading and alignment
-    Traits = pd.read_csv(pheno, sep=r'\s+', low_memory=False)
+    Traits = pd.read_csv(pheno, sep=r'\s+', low_memory=False, dtype={'FID': str, 'IID': str})
     
     if hdf5 is not None:
         ### If HDF5 present and has all samples then keep the order in HDF5
@@ -119,7 +119,7 @@ def preprocess_phenotypes(pheno, covar, bed, keepfile, binary, hdf5=None, phen_t
     ### covariate adjustment
     if covar is not None:
         if log: logging.info("Loading and preparing covariates...")
-        df_covar = pd.read_csv(covar, sep=r'\s+', low_memory=False)
+        df_covar = pd.read_csv(covar, sep=r'\s+', low_memory=False, dtype={'FID': str, 'IID': str})
         covar_columns = df_covar.columns[2:]
         merged_df = pd.merge(Traits.reset_index(drop=True), df_covar)
 
@@ -129,7 +129,7 @@ def preprocess_phenotypes(pheno, covar, bed, keepfile, binary, hdf5=None, phen_t
         #     merged_df = merged_df.fillna(merged_df.median())
         merged_df = merged_df.dropna(axis=0)
 
-        samples_to_keep = np.array(merged_df.FID, dtype=int)
+        samples_to_keep = np.array(merged_df.FID, dtype=str)
         N_total = len(merged_df)
         if log:
             logging.info(
@@ -180,12 +180,12 @@ def preprocess_phenotypes(pheno, covar, bed, keepfile, binary, hdf5=None, phen_t
     ]
     sample_indices_to_keep_dict = {}
     for i in range(len(snp_on_disk.iid)):
-        if int(snp_on_disk.iid[i, 0]) in samples_to_keep:
-            sample_indices_to_keep_dict[int(snp_on_disk.iid[i, 0])] = i
+        if snp_on_disk.iid[i, 0] in samples_to_keep:
+            sample_indices_to_keep_dict[snp_on_disk.iid[i, 0]] = i
 
     sample_indices_to_keep = []
     for i in Traits.FID:
-        sample_indices_to_keep.append(sample_indices_to_keep_dict[int(i)])
+        sample_indices_to_keep.append(sample_indices_to_keep_dict[i])
 
     return (
         Traits,
@@ -216,13 +216,13 @@ def PreparePhenoRHE(Trait, covar_effect, bed, filename, unrel_homo_samples=None)
 
     if unrel_homo_samples is not None:
         unrel_homo_samples = pd.read_csv(
-            unrel_homo_samples, sep=r'\s+', names=["FID", "IID"]
+            unrel_homo_samples, sep=r'\s+', names=["FID", "IID"], dtype={'FID': str, 'IID': str}
         )
         unrel_homo_samples = pd.merge(Trait, unrel_homo_samples, on=["FID", "IID"])
         unrel_sample_list = unrel_homo_samples.FID.tolist()
         logging.info("Number of unrelated homogenous samples: " + str(len(unrel_sample_list)))
     else:
-        unrel_sample_list = np.array(snp_on_disk.iid[:, 0].tolist(), dtype="int")
+        unrel_sample_list = np.array(snp_on_disk.iid[:, 0].tolist())
 
     Trait.set_index('FID', inplace=True, drop=False)
     covar_effects.set_index('FID', inplace=True, drop=False)
@@ -236,8 +236,8 @@ def PreparePhenoRHE(Trait, covar_effect, bed, filename, unrel_homo_samples=None)
     df_rhe = df_rhe.reset_index(drop=True)
     assert len(df_rhe) == len(unrel_sample_list)
 
-    df_rhe.FID = df_rhe.FID.astype("int")
-    df_rhe.IID = df_rhe.IID.astype("int")
+    df_rhe.FID = df_rhe.FID.astype(str)
+    df_rhe.IID = df_rhe.IID.astype(str)
     df_rhe.to_csv(filename + ".rhe", index=None, sep="\t", na_rep="NA")
     logging.info("Saving the postprocessed phenotypes (to be used by RHE) in " + str(filename + ".rhe"))
 

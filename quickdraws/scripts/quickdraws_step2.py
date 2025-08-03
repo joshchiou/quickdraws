@@ -63,18 +63,16 @@ def preprocess_offsets(offsets, sample_file=None, weights=None, is_loco_file=Fal
     if is_loco_file:
         df_concat = offsets
     else:
-        df_concat = pd.read_csv(offsets, sep=r'\s+')
+        df_concat = pd.read_csv(offsets, sep=r'\s+', dtype={'FID': str, 'IID': str})
     pheno_columns = df_concat.columns.tolist().copy()
     if sample_file is not None:
-        sample_file = pd.read_csv(sample_file, sep=r'\s+')
+        sample_file = pd.read_csv(sample_file, sep=r'\s+', dtype={'ID_1': str, 'ID_2': str})
         sample_file = sample_file.rename(columns={"ID_1": "FID", "ID_2": "IID"})
-        sample_file[["FID", "IID"]] = sample_file[["FID", "IID"]].astype("int")
         df_concat = pd.merge(df_concat, sample_file, on=["FID", "IID"])
         df_concat = df_concat[pheno_columns]
     if weights is not None:
-        weights_file = pd.read_csv(weights, sep=r'\s+')
+        weights_file = pd.read_csv(weights, sep=r'\s+', dtype={'ID_1': str, 'ID_2': str})
         weights_file = weights_file.rename(columns={"ID_1": "FID", "ID_2": "IID"})
-        weights_file[["FID", "IID"]] = weights_file[["FID", "IID"]].astype("int")
         df_concat = pd.merge(df_concat, weights_file, on=["FID", "IID"])
         df_concat = df_concat[pheno_columns]
     
@@ -135,8 +133,9 @@ def rege_to_qd_format(filename):
     df_transposed[['FID', 'IID']] = df_transposed['index'].str.split('_', expand=True)
     df_transposed = df_transposed.drop(columns=['index'])
     df_transposed.columns.name = ''
-    df_transposed[['FID', 'IID']] = df_transposed[['FID','IID']].astype('int')
-    return df_transposed[['FID','IID'] + df_transposed.columns[:-2].tolist()]
+    df_transposed = df_transposed[['FID','IID'] + df_transposed.columns[:-2].tolist()]
+    df_transposed[['FID', 'IID']] = df_transposed[['FID', 'IID']].astype(str)
+    return df_transposed
 
 def calibrate_test_stats(
     out, pheno, neff
@@ -244,7 +243,7 @@ def get_test_statistics(
 
     traits = preprocess_offsets(phenofile, weights)
     pheno_columns = traits.columns.tolist()
-    covar_effects = pd.read_csv(covareffectsfile, sep=r'\s+')
+    covar_effects = pd.read_csv(covareffectsfile, sep=r'\s+', dtype={'FID': str, 'IID': str})
     # neff = np.loadtxt(offset + '.step1.neff')
     neff = pd.read_csv(offset + '.neff', sep=r'\s+')
     logging.info("Using estimated effective sample fize from file specified in: " + str(offset) + '.neff')
@@ -264,7 +263,7 @@ def get_test_statistics(
         for chr_no in range(len(unique_chrs))
     )
     if weights is not None:
-        weights_df = pd.read_csv(weights, '\t')
+        weights_df = pd.read_csv(weights, sep='\t', dtype={'FID': str, 'IID': str})
         weights = pd.merge(traits[['FID','IID']], weights_df, on=['FID','IID'])
 
     if binary:
@@ -373,7 +372,7 @@ def get_test_statistics_bgen(
     traits = preprocess_offsets(phenofile, samplefile, weights)
     pheno_columns = traits.columns.tolist()
 
-    covar_effects = pd.read_csv(covareffectsfile, sep=r'\s+')
+    covar_effects = pd.read_csv(covareffectsfile, sep=r'\s+', dtype={'FID': str, 'IID': str})
     offset_list_pre = load_offsets(offset, pheno_columns, unique_chrs, covar_effects) 
     covar_effects = preprocess_offsets(covareffectsfile, samplefile, weights)
 
@@ -390,7 +389,7 @@ def get_test_statistics_bgen(
         firth_null_list = []
 
     if weights is not None:
-        weights_df = pd.read_csv(weights, '\t')
+        weights_df = pd.read_csv(weights, sep='\t', dtype={'FID': str, 'IID': str})
         mdf_weights_traits = pd.merge(traits, weights_df, on=['FID','IID'])
         weights = np.array(mdf_weights_traits[weights_df.columns[2]].values, dtype='float32')
 

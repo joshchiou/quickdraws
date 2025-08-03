@@ -38,14 +38,14 @@ def preprocess_covars(covarFile, iid_fid):
     if covarFile is None:
         covars = np.ones((len(iid_fid),1), dtype='float32')
         return covars
-    covars = pd.read_csv(covarFile, sep=r'\s+')
+    covars = pd.read_csv(covarFile, sep=r'\s+', dtype={'FID': str, 'IID': str})
     covars = pd.merge(
-        pd.DataFrame(iid_fid.astype("int"), columns=["FID", "IID"]),
+        pd.DataFrame(iid_fid, columns=["FID", "IID"]),
         covars,
         on=["FID", "IID"],
     )
-    covars = covars.fillna(covars.median())
     covars = covars[covars.columns[2:]]
+    covars = covars.fillna(covars.median())
     covars = covars.loc[:, covars.std() > 0]
     covars["ALL_CONST"] = 1
     covars = np.array(covars.values, dtype="float32")
@@ -123,7 +123,7 @@ def write_sumstats_file_bgen(
 
 def check_residuals_same_order(residualFileList):
     for chr_no in range(len(residualFileList)):
-        df = pd.read_csv(residualFileList[chr_no], sep=r'\s+')
+        df = pd.read_csv(residualFileList[chr_no], sep=r'\s+', dtype={'FID': str, 'IID': str})
         if chr_no == 0:
             iid = df.IID.values
         else:
@@ -286,10 +286,10 @@ def get_unadjusted_test_statistics(
 
     samples_dict = {}
     for i, fid in enumerate(snp_on_disk.iid[:, 0]):
-        samples_dict[int(fid)] = i
+        samples_dict[fid] = i
     sample_indices = []
     for fid in pheno.FID:
-        sample_indices.append(samples_dict[int(fid)])
+        sample_indices.append(samples_dict[fid])
     iid_fid = snp_on_disk.iid[sample_indices]
     snp_on_disk = snp_on_disk[sample_indices, :]
 
@@ -429,8 +429,8 @@ def get_unadjusted_test_statistics_bgen(
     fid_iid = np.array(
         [
             [
-                int(snp_on_disk.iid[i, 1].split(" ")[0]),
-                int(snp_on_disk.iid[i, 1].split(" ")[1]),
+                snp_on_disk.iid[i, 1].split(" ")[0],
+                snp_on_disk.iid[i, 1].split(" ")[1],
             ]
             for i in range(snp_on_disk.shape[0])
         ]
@@ -458,10 +458,10 @@ def get_unadjusted_test_statistics_bgen(
 
     samples_dict = {}
     for i, fid in enumerate(fid_iid[:, 0]):
-        samples_dict[int(fid)] = i
+        samples_dict[fid] = i
     sample_indices = []
     for fid in pheno.FID:
-        sample_indices.append(samples_dict[int(fid)])
+        sample_indices.append(samples_dict[fid])
     iid_fid_in_bgen = fid_iid[sample_indices]
     snp_on_disk = snp_on_disk[sample_indices, snp_mask]
     chr_map = np.array(snp_on_disk.pos[:, 0], dtype="int")  ## chr_no
