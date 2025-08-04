@@ -157,7 +157,7 @@ class BBB_Linear_spike_slab(nn.Module):
             spike.mul(sig1.pow(2)) + spike.mul(mu1.pow(2)) - mean_preactivations.pow(2)
         )
         if device.type == 'cuda':
-            eps = torch.cuda.FloatTensor(x.shape[0], mu1.shape[0]).normal_()
+            eps = torch.randn(x.shape[0], mu1.shape[0], device=device)
         elif device.type == 'mps':
             eps = torch.randn(x.shape[0], mu1.shape[0], device=device)
         else:
@@ -541,7 +541,11 @@ class Trainer:
                         input.to(self.device),
                         covar_effect.to(self.device),
                     )
-                    preds_c = input[:, self.chr_map != chr]@(beta[:, self.chr_map != chr].T)
+                    # Ensure beta and chr_map are on the same device as input
+                    beta_device = beta.to(self.device)
+                    chr_map_device = self.chr_map.to(self.device)
+                    
+                    preds_c = input[:, chr_map_device != chr]@(beta_device[:, chr_map_device != chr].T)
                     '''adjusts predictions by adding covariate effects (covar_effect), accounting for non-genetic factors.'''
                     preds_c += covar_effect
                     ''' Applies a sigmoid transformation to the predictions if the analysis is binary (self.args.binary), converting the linear output to probabilities.'''
@@ -597,8 +601,16 @@ class Trainer:
                         binary=self.args.binary,
                     )
                     
-                    # Move predictions back to CPU for collection
-                    preds = preds.cpu()
+                    # Handle NaN values before moving to CPU (both tensors on same device)
+                    label_gpu = label.to(model_device)
+                    nan_mask = torch.isnan(label_gpu)
+                    label_gpu[nan_mask] = preds[nan_mask]
+                    
+                    # Move back to original device and then to CPU for collection
+                    label_corrected = label_gpu.to(self.device)
+                    preds_cpu = preds.cpu()
+                    label_cpu = label_corrected.cpu()
+                    
                     # spike = torch.clamp(model.sc1.spike1, 1e-6, 1.0 - 1e-6)
                     # mu = model.fc1.weight
                     # beta = spike.mul(mu)
@@ -611,9 +623,8 @@ class Trainer:
                         
                     #     preds_arr_chr[model_no][chr_no].extend(preds_c.cpu().numpy().tolist())
                     
-                    label[torch.isnan(label)] = preds[torch.isnan(label)]
-                    preds_arr[model_no].extend(preds.cpu().numpy().tolist())
-                    labels_arr[model_no].extend(label.cpu().numpy().tolist())
+                    preds_arr[model_no].extend(preds_cpu.numpy().tolist())
+                    labels_arr[model_no].extend(label_cpu.numpy().tolist())
 
             test_loss = []
             for model_no in range(len(self.model_list)):
@@ -701,7 +712,12 @@ class Trainer:
                     spike = torch.clamp(model.sc1.spike1, 1e-6, 1.0 - 1e-6)
                     mu = model.fc1.weight
                     beta = spike.mul(mu)
-                    preds = (model_input[:, self.chr_map != self.unique_chr_map[chr_no]]) @ (
+                    
+                    # Ensure chr_map and comparison value are on the same device as input
+                    chr_map_device = self.chr_map.to(model_device)
+                    chr_comparison = self.unique_chr_map[chr_no]
+                    
+                    preds = (model_input[:, chr_map_device != chr_comparison]) @ (
                         beta.T
                     )
                     ## caution: remove sigmoid and covar_effect to save in regenie format
@@ -1227,6 +1243,7 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
         mu = (
             trainer.model_list[best_alpha[prs_no]]
             .fc1.weight[prs_no]
+            .to(device)  # Ensure mu is on the correct device
             # .cpu()
             # .detach()
             # .numpy()
@@ -1237,6 +1254,7 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
                 1e-6,
                 1.0 - 1e-6,
             )
+            .to(device)  # Ensure spike is on the correct device
             # .cpu()
             # .detach()
             # .numpy()
