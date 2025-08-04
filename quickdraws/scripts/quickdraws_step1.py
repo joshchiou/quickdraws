@@ -135,6 +135,12 @@ def main():
         "--validate_every", help="How often do you wanna validate the whole genomre regression (default = -1, which means never)", type=int, default=-1
     )
     parser.add_argument(
+        "--early_stopping_patience", help="Number of epochs to wait for improvement before stopping each model (0 disables early stopping)", type=int, default=10
+    )
+    parser.add_argument(
+        "--early_stopping_min_delta", help="Minimum improvement in validation loss to reset patience counter", type=float, default=1e-4
+    )
+    parser.add_argument(
         "--lr",
         help="Learning rate of the optimizer",
         type=float,

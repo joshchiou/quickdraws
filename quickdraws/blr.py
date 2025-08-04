@@ -1080,12 +1080,56 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
     ##caution!!
     log_dict = {}
     
+    # Early stopping setup
+    early_stopping_enabled = hasattr(args, 'early_stopping_patience') and args.early_stopping_patience > 0
+    if early_stopping_enabled:
+        best_losses = [float('inf')] * len(alpha)
+        patience_counters = [0] * len(alpha)
+        stopped_models = [False] * len(alpha)
+        early_stopping_patience = args.early_stopping_patience
+        early_stopping_min_delta = getattr(args, 'early_stopping_min_delta', 1e-4)
+        logging.info(f"Early stopping enabled: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
+    else:
+        logging.info("Early stopping disabled - training for full number of epochs")
+    
     '''
     Iterates over a specified number of epochs (args.alpha_search_epochs), 
     during which the models are trained using the training dataset.
     '''
     for epoch in tqdm(range(args.alpha_search_epochs)):
         log_dict = trainer.train_epoch(epoch)
+        
+        # Check early stopping if enabled and validation is performed
+        if early_stopping_enabled and not trainer.never_validate:
+            # Get validation metrics
+            temp_log_dict = trainer.log_r2_loss({})
+            
+            # Check early stopping for each model
+            any_improvement = False
+            for model_no, alpha_val in enumerate(alpha):
+                if stopped_models[model_no]:
+                    continue
+                    
+                # Get current validation loss for this model
+                current_loss = temp_log_dict[f"mean_test_loss_{alpha_val}"]
+                
+                # Check if this is the best loss so far
+                if current_loss < best_losses[model_no] - early_stopping_min_delta:
+                    best_losses[model_no] = current_loss
+                    patience_counters[model_no] = 0
+                    any_improvement = True
+                else:
+                    patience_counters[model_no] += 1
+                    
+                # Stop this model if patience exceeded
+                if patience_counters[model_no] >= early_stopping_patience:
+                    stopped_models[model_no] = True
+                    logging.info(f"Early stopping for alpha {alpha_val} at epoch {epoch+1}")
+            
+            # Optional: stop entirely if all models have stopped
+            if all(stopped_models):
+                logging.info(f"All models stopped early at epoch {epoch+1}")
+                break
     
     ## re-evaluate loss and r2 and the end of training
     '''
