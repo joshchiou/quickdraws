@@ -584,13 +584,21 @@ class Trainer:
                     label.to(self.device),
                 )
                 for model_no, model in enumerate(self.model_list):
+                    # Move data to the same device as the model
+                    model_device = next(model.parameters()).device
+                    model_input = input.to(model_device)
+                    model_covar_effect = covar_effect.to(model_device)
+                    
                     preds, _ = model(
-                        input,
-                        covar_effect,
+                        model_input,
+                        model_covar_effect,
                         only_output=True,
                         test=True,
                         binary=self.args.binary,
                     )
+                    
+                    # Move predictions back to CPU for collection
+                    preds = preds.cpu()
                     # spike = torch.clamp(model.sc1.spike1, 1e-6, 1.0 - 1e-6)
                     # mu = model.fc1.weight
                     # beta = spike.mul(mu)
@@ -683,15 +691,17 @@ class Trainer:
         with torch.no_grad():
             prev = 0
             for input, covar_effect, label in self.test_dataloader:
-                input = input.to(self.device)
                 covar_effect_arr[prev: prev + len(input)] = covar_effect.numpy()
                 for model_no, model in enumerate(self.model_list):
+                    # Move input to the same device as the model
+                    model_device = next(model.parameters()).device
+                    model_input = input.to(model_device)
                     chr_no = model_no % self.num_chr
                     phen_no = self.pheno_for_model[model_no // self.num_chr]
                     spike = torch.clamp(model.sc1.spike1, 1e-6, 1.0 - 1e-6)
                     mu = model.fc1.weight
                     beta = spike.mul(mu)
-                    preds = (input[:, self.chr_map != self.unique_chr_map[chr_no]]) @ (
+                    preds = (model_input[:, self.chr_map != self.unique_chr_map[chr_no]]) @ (
                         beta.T
                     )
                     ## caution: remove sigmoid and covar_effect to save in regenie format
@@ -749,16 +759,24 @@ class Trainer:
             reg_loss_arr = []
             total_loss_arr = []
             for model_no, model in enumerate(self.model_list):
-                preds, reg_loss = model(input, covar_effect_4x, binary=self.args.binary)
-                mse_loss = self.loss_func(preds, label_4x, h2*(1-var_covar_effect)+var_covar_effect)
+                # Move data to the same device as the model
+                model_device = next(model.parameters()).device
+                model_input = input.to(model_device)
+                model_covar_effect_4x = covar_effect_4x.to(model_device)
+                model_label_4x = label_4x.to(model_device)
+                model_h2 = h2.to(model_device)
+                model_var_covar_effect = var_covar_effect.to(model_device)
+                
+                preds, reg_loss = model(model_input, model_covar_effect_4x, binary=self.args.binary)
+                mse_loss = self.loss_func(preds, model_label_4x, model_h2*(1-model_var_covar_effect)+model_var_covar_effect)
                 for k in range(self.args.forward_passes - 1):
                     preds, _ = model(
-                        input,
-                        covar_effect_4x,
+                        model_input,
+                        model_covar_effect_4x,
                         only_output=True,
                         binary=self.args.binary,
                     )
-                    mse1 = self.loss_func(preds, label_4x, h2*(1-var_covar_effect)+var_covar_effect)
+                    mse1 = self.loss_func(preds, model_label_4x, model_h2*(1-model_var_covar_effect)+model_var_covar_effect)
                     mse_loss = mse_loss + mse1
                 mse_loss = (
                     mse_loss / 2 / self.args.forward_passes
@@ -845,23 +863,33 @@ class Trainer:
             label_4x = label.unsqueeze(0).repeat(2, 1, 1)
             covar_effect_4x = covar_effect.unsqueeze(0).repeat(2, 1, 1)
             for model_no, model in enumerate(self.model_list):
+                # Move data to the same device as the model
+                model_device = next(model.parameters()).device
+                
                 input_loco_chr = torch.hstack(
                     (
                         input[:, 0 : self.chr_loc[model_no % self.num_chr]],
                         input[:, self.chr_loc[model_no % self.num_chr + 1] :],
                     )
-                )
+                ).to(model_device)
+                
+                model_covar_effect_4x = covar_effect_4x[
+                    :, :, self.pheno_for_model[model_no // self.num_chr]
+                ].to(model_device)
+                
+                model_label_4x = label_4x[:, :, self.pheno_for_model[model_no // self.num_chr]].to(model_device)
+                model_h2 = h2[:, :, self.pheno_for_model[model_no // self.num_chr]].to(model_device)
+                model_var_covar_effect = var_covar_effect[:, :, self.pheno_for_model[model_no // self.num_chr]].to(model_device)
+                
                 preds, reg_loss = model(
                     input_loco_chr,
-                    covar_effect_4x[
-                        :, :, self.pheno_for_model[model_no // self.num_chr]
-                    ],
+                    model_covar_effect_4x,
                     binary=self.args.binary,
                 )
                 mse_loss = self.loss_func(
                     preds,
-                    label_4x[:, :, self.pheno_for_model[model_no // self.num_chr]],
-                    h2[:, :, self.pheno_for_model[model_no // self.num_chr]]*(1-var_covar_effect[:, :, self.pheno_for_model[model_no // self.num_chr]])+var_covar_effect[:, :, self.pheno_for_model[model_no // self.num_chr]],
+                    model_label_4x,
+                    model_h2*(1-model_var_covar_effect)+model_var_covar_effect,
                 )
                 loss = 0.5 * mse_loss + reg_loss
 
@@ -1000,7 +1028,14 @@ def initialize_model(
                 )
                 model = model.to(device)
                 if device == 'cpu':
-                    model = torch.compile(model) 
+                    model = torch.compile(model)
+                elif device == 'cuda' and torch.cuda.device_count() > 1:
+                    # Distribute models across available GPUs
+                    gpu_id = len(model_list) % torch.cuda.device_count()
+                    model = model.to(f'cuda:{gpu_id}')
+                    logging.info(f"Model {len(model_list)} assigned to GPU {gpu_id}")
+                else:
+                    pass
                 model_list.append(model)
         else:
             model = Model(
@@ -1016,6 +1051,13 @@ def initialize_model(
             model = model.to(device)
             if device == 'cpu':
                 model = torch.compile(model)
+            elif device == 'cuda' and torch.cuda.device_count() > 1:
+                # Distribute models across available GPUs
+                gpu_id = len(model_list) % torch.cuda.device_count()
+                model = model.to(f'cuda:{gpu_id}')
+                logging.info(f"Model {len(model_list)} assigned to GPU {gpu_id}")
+            else:
+                pass
             model_list.append(model)
     '''The function returns the list of initialized models (model_list), ready for training or inference.'''
     return model_list
@@ -1229,6 +1271,16 @@ def blr_spike_slab(args, h2, hdf5_filename, device="cuda"):
     '''
     overall_start_time = time.time()
     torch.set_num_threads(get_cpu_count())  ## speedify computation on CPU
+    
+    # Log multi-GPU availability
+    if device == 'cuda' and torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        logging.info(f"CUDA available with {num_gpus} GPU(s)")
+        if num_gpus > 1:
+            logging.info("Multi-GPU training enabled - models will be distributed across GPUs")
+        for i in range(num_gpus):
+            logging.info(f"  GPU {i}: {torch.cuda.get_device_name(i)}")
+    
     if not args.wandb_mode == "disabled":
         logging.info("Initializing wandb to log the progress..")
         wandb.init(
