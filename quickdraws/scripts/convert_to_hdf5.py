@@ -72,7 +72,7 @@ def get_geno_covar_effect(bed, sample_indices, covars, snp_mask, chunk_size=512,
         df_covar["ALL_CONST"] = 1
         df_covar = df_covar.fillna(df_covar.median())
         covars = df_covar.values
-    
+
     K = np.linalg.inv(covars.T @ covars)
 
     geno_covar_effect = np.zeros((covars.shape[1], snp_on_disk.shape[1]))
@@ -83,6 +83,9 @@ def get_geno_covar_effect(bed, sample_indices, covars, snp_mask, chunk_size=512,
             .read(dtype="float64")
             .val
         )
+        # patch for performance issues warning with numba
+        x = np.ascontiguousarray(x)
+        covars = np.ascontiguousarray(covars)
         geno_covar_effect_numba, xtx_numba = get_xtx(x, covars, K)
         xtx_numba[np.std(x, axis=0) == 0] = 0  ## set fixed variants to have 0 std (o/w have small -ve values due to numerical issues in numba)
         xtx[i : min(i + chunk_size, snp_on_disk.shape[1])] = xtx_numba
@@ -142,7 +145,7 @@ def convert_to_hdf5(
             logging.info("Didn't Find all samples from bed file in prespecified HDF5 file, using Bed file")
             master_hdf5.close()
             master_hdf5 = None
-        
+
 
     chunk_size = min(chunk_size, len(sample_indices))
 
@@ -203,7 +206,7 @@ def convert_to_hdf5(
                     col[~mask] = int(np.round(np.median(col[mask])))
                 else:
                     col[:] = 0
-            
+
             dset1[i : i + x.shape[0]] = np.packbits(np.array(x > 0, dtype=np.int8), axis=1)
             dset2[i : i + x.shape[0]] = np.packbits(np.array(x > 1, dtype=np.int8), axis=1)
             ## np.packbits() requires most time (~ 80%)
@@ -215,7 +218,7 @@ def convert_to_hdf5(
 
     h1.close()
     logging.info("Done saving the genotypes to hdf5 file " + str(out + '.hdf5'))
-    
+
     if master_hdf5 is not None:
         master_hdf5.close()
 
@@ -277,7 +280,7 @@ def make_master_hdf5(
             .read(dtype="int8", _require_float32_64=False)
             .val
         )
-        
+
         for col_idx in range(x.shape[1]):
             col = x[:, col_idx]
             mask = (col >= 0)
