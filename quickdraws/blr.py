@@ -942,7 +942,8 @@ def initialize_model(
     chr_map=None,
     mu=None,
     spike=None,
-    predBetasFlag=False
+    predBetasFlag=False,
+    warm_start=False
 ):
     '''
      If chr_map is provided, the unique chromosomes are identified. 
@@ -1076,6 +1077,42 @@ def initialize_model(
                 pass
             model_list.append(model)
     '''The function returns the list of initialized models (model_list), ready for training or inference.'''
+    
+    # Implement warm start for similar alpha values (except the first/smallest alpha)
+    if warm_start and loco != "exact":
+        for alpha_no in range(1, len(alpha_list)):  # Start from second alpha
+            current_alpha = alpha_list[alpha_no]
+            source_alpha_no = alpha_no - 1  # Use previous alpha as source
+            source_alpha = alpha_list[source_alpha_no]
+            
+            # Transfer weights from source model to current model
+            source_model = model_list[source_alpha_no]
+            current_model = model_list[alpha_no]
+            
+            # Transfer fc1 weights (mu parameters) directly
+            current_model.fc1.weight.data = source_model.fc1.weight.data.clone()
+            
+            # Adapt spike parameters based on sparsity ratio
+            sparsity_ratio = current_alpha / source_alpha
+            
+            with torch.no_grad():
+                if current_alpha > source_alpha:  # More sparse target
+                    # Reduce spike values to increase sparsity
+                    adapted_spike = torch.clamp(
+                        source_model.sc1.spike1.data / sparsity_ratio,
+                        1e-6, 1.0 - 1e-6
+                    )
+                else:  # Less sparse target
+                    # Increase spike values to reduce sparsity  
+                    adapted_spike = torch.clamp(
+                        source_model.sc1.spike1.data * (1.0 / sparsity_ratio),
+                        1e-6, 1.0 - 1e-6
+                    )
+                
+                current_model.sc1.spike1.data = adapted_spike
+            
+            logging.info(f"Warm start: α={current_alpha:.3f} initialized from α={source_alpha:.3f} (ratio={sparsity_ratio:.3f})")
+    
     return model_list
 
 def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda"):
@@ -1106,6 +1143,7 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
 
     The hyperparameter search utilizes the entire dataset (all chromosomes) but splits into 90% train and 10% test data
     '''
+    warm_start_enabled = getattr(args, 'warm_start', True)
     model_list = initialize_model(
         alpha,
         std_genotype,
@@ -1114,6 +1152,7 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
         dim_out,
         torch.sum(~(torch.isnan(train_dataset.output).all(axis=1))),
         device,
+        warm_start=warm_start_enabled  # Enable warm start for hyperparameter search
     )
     # Define trainer for training the model
     logging.info("Starting search for optimal alpha...")
@@ -1138,17 +1177,36 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
     ##caution!!
     log_dict = {}
     
-    # Early stopping setup
+    # Early stopping setup with enhanced features
     early_stopping_enabled = hasattr(args, 'early_stopping_patience') and args.early_stopping_patience > 0
     if early_stopping_enabled:
         best_losses = [float('inf')] * len(alpha)
         patience_counters = [0] * len(alpha)
         stopped_models = [False] * len(alpha)
+        epochs_since_improvement = [0] * len(alpha)  # Track epochs since last improvement
         early_stopping_patience = args.early_stopping_patience
         early_stopping_min_delta = getattr(args, 'early_stopping_min_delta', 1e-4)
         logging.info(f"Early stopping enabled: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
+        
+        # Adaptive validation frequency - validate more frequently early, less frequently later
+        adaptive_validation_enabled = getattr(args, 'adaptive_validation', True)
+        def get_validation_frequency(epoch, total_epochs):
+            if not adaptive_validation_enabled:
+                return args.validate_every
+            if epoch < total_epochs * 0.2:  # First 20% of epochs
+                return max(1, args.validate_every // 2)  # Validate twice as often
+            elif epoch < total_epochs * 0.5:  # Next 30% of epochs  
+                return args.validate_every
+            else:  # Last 50% of epochs
+                return min(args.validate_every * 2, 5)  # Validate less frequently
+        
     else:
         logging.info("Early stopping disabled - training for full number of epochs")
+        adaptive_validation_enabled = getattr(args, 'adaptive_validation', True)
+        def get_validation_frequency(epoch, total_epochs):
+            if not adaptive_validation_enabled:
+                return args.validate_every
+            return args.validate_every
     
     '''
     Iterates over a specified number of epochs (args.alpha_search_epochs), 
@@ -1157,35 +1215,49 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
     for epoch in tqdm(range(args.alpha_search_epochs)):
         log_dict = trainer.train_epoch(epoch)
         
+        # Adaptive validation frequency
+        current_validation_freq = get_validation_frequency(epoch, args.alpha_search_epochs)
+        should_validate = (epoch + 1) % current_validation_freq == 0 or epoch == args.alpha_search_epochs - 1
+        
         # Check early stopping if enabled and validation is performed
-        if early_stopping_enabled and not trainer.never_validate:
+        if early_stopping_enabled and not trainer.never_validate and should_validate:
             # Get validation metrics
             temp_log_dict = trainer.log_r2_loss({})
             
             # Check early stopping for each model
             any_improvement = False
+            active_models = sum(1 for stopped in stopped_models if not stopped)
+            
             for model_no, alpha_val in enumerate(alpha):
                 if stopped_models[model_no]:
                     continue
                     
                 # Get current validation loss for this model
                 current_loss = temp_log_dict[f"mean_test_loss_{alpha_val}"]
+                epochs_since_improvement[model_no] += current_validation_freq
                 
                 # Check if this is the best loss so far
                 if current_loss < best_losses[model_no] - early_stopping_min_delta:
                     best_losses[model_no] = current_loss
                     patience_counters[model_no] = 0
+                    epochs_since_improvement[model_no] = 0
                     any_improvement = True
+                    logging.info(f"Alpha {alpha_val}: New best validation loss {current_loss:.6f} at epoch {epoch+1}")
                 else:
-                    patience_counters[model_no] += 1
+                    patience_counters[model_no] += current_validation_freq
                     
                 # Stop this model if patience exceeded
                 if patience_counters[model_no] >= early_stopping_patience:
                     stopped_models[model_no] = True
-                    logging.info(f"Early stopping for alpha {alpha_val} at epoch {epoch+1}")
+                    logging.info(f"Early stopping for alpha {alpha_val} at epoch {epoch+1} (best loss: {best_losses[model_no]:.6f})")
             
-            # Optional: stop entirely if all models have stopped
-            if all(stopped_models):
+            # Log progress every few validations
+            if (epoch + 1) % (current_validation_freq * 3) == 0:
+                active_models = sum(1 for stopped in stopped_models if not stopped)
+                logging.info(f"Epoch {epoch+1}: {active_models}/{len(alpha)} models still active")
+            
+            # Optional: stop entirely if all models have stopped (but give at least 20% of epochs)
+            if all(stopped_models) and epoch > args.alpha_search_epochs * 0.2:
                 logging.info(f"All models stopped early at epoch {epoch+1}")
                 break
     
@@ -1650,8 +1722,8 @@ if __name__ == "__main__":
         "-scheduler",
         "--cosine_scheduler",
         help="Cosine scheduling the outer learning rate",
-        type=str_to_bool,
-        default="false",
+        action="store_true",
+        default=False
     )
     parser.add_argument(
         "--batch_size", help="Batch size of the dataloader", type=int, default=128
@@ -1673,6 +1745,18 @@ if __name__ == "__main__":
         help="The training split proportion in (0,1)",
         type=float,
         default=0.8,
+    )
+    parser.add_argument(
+        "--warm_start", 
+        help="Enable warm start initialization for alpha hyperparameter search", 
+        action="store_true",
+        default=False
+    )
+    parser.add_argument(
+        "--adaptive_validation", 
+        help="Enable adaptive validation frequency during hyperparameter search", 
+        action="store_true",
+        default=False
     )
     ## path arguments
     parser.add_argument(
