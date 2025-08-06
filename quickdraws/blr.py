@@ -650,10 +650,14 @@ class Trainer:
         
         return var
 
-    def validation(self):
+    def validation(self, stopped_models=None):
         '''
         Performs a validation run, using the models to predict on the test dataset and compute loss metrics. 
         '''
+        # Default to validating all models if no stopping info provided
+        if stopped_models is None:
+            stopped_models = [False] * len(self.model_list)
+            
         labels_arr = [[] for _ in range(len(self.model_list))]
         preds_arr = [[] for _ in range(len(self.model_list))]
         # preds_arr_chr = [[[] for k in range(self.num_chr)] for _ in range(len(self.model_list))]
@@ -665,6 +669,13 @@ class Trainer:
                     label.to(self.device),
                 )
                 for model_no, model in enumerate(self.model_list):
+                    # For stopped models, append empty predictions to maintain array structure
+                    if stopped_models[model_no]:
+                        # Maintain consistent array structure for stopped models
+                        if len(preds_arr[model_no]) == 0:  # First batch, set up empty structure
+                            preds_arr[model_no] = []
+                            labels_arr[model_no] = []
+                        continue
                     preds, _ = model(
                         input,
                         covar_effect,
@@ -708,12 +719,17 @@ class Trainer:
 
             test_loss = []
             for model_no in range(len(self.model_list)):
-                test_loss.append(
-                    self.loss_func(
-                        torch.tensor(preds_arr[model_no]),
-                        torch.tensor(labels_arr[model_no]),
+                # Only compute loss for non-stopped models
+                if not stopped_models[model_no] and len(preds_arr[model_no]) > 0:
+                    test_loss.append(
+                        self.loss_func(
+                            torch.tensor(preds_arr[model_no]),
+                            torch.tensor(labels_arr[model_no]),
+                        )
                     )
-                )
+                else:
+                    # Use a high placeholder loss for stopped models to ensure they're not selected
+                    test_loss.append(torch.tensor(float('inf')))
             preds_arr = np.array(preds_arr)  ## 6 x N x O
             labels_arr = np.array(labels_arr)  ## 6 x N x O
             # preds_arr_chr = np.array(preds_arr_chr) ## 6 x 22 x N x O
@@ -725,22 +741,34 @@ class Trainer:
             # preds_arr_chr,
         )
 
-    def log_r2_loss(self, log_dict):
+    def log_r2_loss(self, log_dict, stopped_models=None):
         ## Validation once a epoch
         (
             test_loss,
             preds_arr,
             labels_arr,
             # preds_arr_chr
-        ) = self.validation()
+        ) = self.validation(stopped_models)
+
+        # Default to validating all models if no stopping info provided
+        if stopped_models is None:
+            stopped_models = [False] * len(self.model_list)
 
         ## Average test loss
         for model_no, alpha in enumerate(self.alpha):
+            # Skip metrics calculation for stopped models
+            if stopped_models[model_no] or len(preds_arr[model_no]) == 0:
+                continue
+                
             log_dict["mean_test_loss_" + str(alpha)] = test_loss[model_no] / len(
                 preds_arr[model_no]
             )
             ## Per phenotype R2 calculation
             for prs_no in range(preds_arr[model_no].shape[1]):
+                # Skip if no predictions (stopped model)
+                if len(preds_arr[model_no]) == 0:
+                    continue
+                    
                 test_loss_anc = self.loss_func(
                     torch.as_tensor(preds_arr[model_no, :, prs_no]),
                     torch.as_tensor(labels_arr[model_no, :, prs_no]),
@@ -827,7 +855,7 @@ class Trainer:
             
             pd.DataFrame(data = neff.T, columns = np.array(self.unique_chr_map, dtype='int')).to_csv(out + '.neff', sep = ' ', index=None)
 
-    def train_epoch(self, epoch):
+    def train_epoch(self, epoch, stopped_models=None, last_known_losses=None):
         '''
         Main training function for whole-genome regression
         '''
@@ -842,6 +870,12 @@ class Trainer:
         data_time = 0
         forward_time = 0
         backward_time = 0
+        
+        # Default to training all models if no stopping info provided
+        if stopped_models is None:
+            stopped_models = [False] * len(self.model_list)
+        if last_known_losses is None:
+            last_known_losses = [{'mse': 0.0, 'reg': 0.0, 'total': 0.0} for _ in range(len(self.model_list))]
         
         for batch_idx, (input, covar_effect, label) in enumerate(self.train_dataloader):
             batch_start_time = time.time()
@@ -866,6 +900,13 @@ class Trainer:
             
             forward_start_time = time.time()
             for model_no, model in enumerate(self.model_list):
+                # Skip training for stopped models - this is the key fix!
+                if stopped_models[model_no]:
+                    # Use last known losses instead of 0.0 to preserve actual performance
+                    mse_loss_arr.append(last_known_losses[model_no]['mse'])
+                    reg_loss_arr.append(last_known_losses[model_no]['reg'])
+                    total_loss_arr.append(last_known_losses[model_no]['total'])
+                    continue
                 preds, reg_loss = model(input, covar_effect_4x, binary=self.args.binary)
                 mse_loss = self.loss_func(preds, label_4x, h2*(1-var_covar_effect)+var_covar_effect)
                 for k in range(self.args.forward_passes - 1):
@@ -886,6 +927,13 @@ class Trainer:
                 reg_loss_arr.append(reg_loss.item())
                 total_loss_arr.append(loss.item())
                 
+                # Update last known losses for this model
+                last_known_losses[model_no] = {
+                    'mse': mse_loss.item(),
+                    'reg': reg_loss.item(),
+                    'total': loss.item()
+                }
+                
                 forward_time += time.time() - forward_start_time
                 backward_start_time = time.time()
                 
@@ -904,7 +952,7 @@ class Trainer:
                 % (self.validate_every * self.num_samples // self.args.batch_size)
                 == 0
             ):
-                log_dict = self.log_r2_loss(log_dict)
+                log_dict = self.log_r2_loss(log_dict, stopped_models)
 
             if not self.never_validate and (
                 self.wandb_step % 50 == 0
@@ -1253,27 +1301,50 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
     
     # Early stopping setup
     early_stopping_enabled = hasattr(args, 'early_stopping_patience') and args.early_stopping_patience > 0
+    warm_start_enabled = getattr(args, 'warm_start', False)
+    
     if early_stopping_enabled:
         best_losses = [float('inf')] * len(alpha)
         patience_counters = [0] * len(alpha)
         stopped_models = [False] * len(alpha)
+        last_known_losses = [{'mse': 0.0, 'reg': 0.0, 'total': 0.0} for _ in range(len(alpha))]
         early_stopping_patience = args.early_stopping_patience
         early_stopping_min_delta = getattr(args, 'early_stopping_min_delta', 1e-4)
         logging.info(f"Early stopping enabled: patience={early_stopping_patience}, min_delta={early_stopping_min_delta}")
     else:
+        stopped_models = None
+        last_known_losses = None
         logging.info("Early stopping disabled - training for full number of epochs")
+    
+    # Warm start setup for progressive improvement
+    if warm_start_enabled and early_stopping_enabled:
+        logging.info("Warm start enabled - will use converged models to initialize similar alphas")
+        warm_start_queue = []  # Track models ready for warm start transfer
+        alpha_similarities = {}  # Cache alpha similarity relationships
+        
+        # Pre-calculate alpha similarities for efficient warm start decisions
+        for i, alpha_i in enumerate(alpha):
+            alpha_similarities[i] = []
+            for j, alpha_j in enumerate(alpha):
+                if i != j:
+                    # Alphas within 2x factor are considered similar enough for warm start
+                    similarity_ratio = max(alpha_i, alpha_j) / min(alpha_i, alpha_j)
+                    if similarity_ratio <= 2.0:
+                        alpha_similarities[i].append((j, similarity_ratio))
+            # Sort by similarity (closest first)
+            alpha_similarities[i].sort(key=lambda x: x[1])
     
     '''
     Iterates over a specified number of epochs (args.alpha_search_epochs), 
     during which the models are trained using the training dataset.
     '''
     for epoch in tqdm(range(args.alpha_search_epochs)):
-        log_dict = trainer.train_epoch(epoch)
+        log_dict = trainer.train_epoch(epoch, stopped_models, last_known_losses)
         
         # Check early stopping if enabled and validation is performed
         if early_stopping_enabled and not trainer.never_validate:
             # Get validation metrics
-            temp_log_dict = trainer.log_r2_loss({})
+            temp_log_dict = trainer.log_r2_loss({}, stopped_models)
             
             # Check early stopping for each model
             any_improvement = False
@@ -1296,6 +1367,47 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
                 if patience_counters[model_no] >= early_stopping_patience:
                     stopped_models[model_no] = True
                     logging.info(f"Early stopping for alpha {alpha_val} at epoch {epoch+1}")
+                    
+                    # Add to warm start queue if converged successfully
+                    if warm_start_enabled and current_loss < float('inf'):
+                        model_module = trainer._get_model_module(trainer.model_list[model_no])
+                        converged_params = {
+                            'mu': model_module.fc1.weight.data.clone(),
+                            'spike': model_module.sc1.spike1.data.clone(),
+                            'alpha_idx': model_no,
+                            'alpha_val': alpha_val,
+                            'final_loss': current_loss
+                        }
+                        warm_start_queue.append(converged_params)
+                        logging.info(f"Added alpha {alpha_val} to warm start queue (loss: {current_loss:.6f})")
+                        
+                        # Try to warm start similar models that haven't converged yet
+                        for similar_idx, similarity_ratio in alpha_similarities[model_no]:
+                            if not stopped_models[similar_idx] and patience_counters[similar_idx] > early_stopping_patience // 2:
+                                # Model is struggling - try warm start
+                                similar_model = trainer._get_model_module(trainer.model_list[similar_idx])
+                                
+                                # Scale parameters based on alpha ratio for better initialization
+                                scale_factor = math.sqrt(alpha_val / alpha[similar_idx])
+                                warm_mu = converged_params['mu'] * scale_factor
+                                warm_spike = torch.clamp(converged_params['spike'], 1e-6, 1.0 - 1e-6)
+                                
+                                # Apply warm start
+                                similar_model.fc1.weight.data = warm_mu
+                                similar_model.sc1.spike1.data = warm_spike
+                                
+                                # Reset patience counter to give warm started model a chance
+                                patience_counters[similar_idx] = max(0, patience_counters[similar_idx] - early_stopping_patience // 3)
+                                
+                                logging.info(f"Warm started alpha {alpha[similar_idx]} from converged alpha {alpha_val} "
+                                           f"(similarity: {similarity_ratio:.2f}x, reset patience: {patience_counters[similar_idx]})")
+                    
+                    # Optional: Free GPU memory by clearing gradients and moving to CPU
+                    if device == 'cuda':
+                        with torch.no_grad():
+                            # Move model to CPU to free GPU memory but keep it accessible
+                            trainer.model_list[model_no].cpu()
+                            torch.cuda.empty_cache()
             
             # Optional: stop entirely if all models have stopped
             if all(stopped_models):
@@ -1308,22 +1420,29 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
     These metrics are calculated for each phenotype and alpha value, providing insight into which alpha leads to the best 
     model performance in terms of prediction accuracy and error minimization.
     '''
-    log_dict = trainer.log_r2_loss(log_dict)
+    log_dict = trainer.log_r2_loss(log_dict, stopped_models)
     output_loss = np.zeros((dim_out, len(alpha)))
     output_r2 = np.zeros((dim_out, len(alpha)))
     # output_r2_chr = np.zeros((trainer.num_chr, dim_out, len(alpha)))
     output_neff = np.zeros((dim_out, len(alpha)))
     for prs_no in range(dim_out):
         for model_no, alpha_i in enumerate(alpha):
-            output_loss[prs_no, model_no] = log_dict[
-                "test_loss_pheno_" + str(prs_no) + "_alpha_" + str(alpha_i)
-            ]
-            output_r2[prs_no, model_no] = log_dict[
-                "test_r2_pheno_" + str(prs_no) + "_alpha_" + str(alpha_i)
-            ]
-            output_neff[prs_no, model_no] = log_dict[
-                "neff_pheno_" + str(prs_no) + "_alpha_" + str(alpha_i)
-            ]
+            # Skip stopped models when collecting final results
+            if early_stopping_enabled and stopped_models and stopped_models[model_no]:
+                # Use inf loss for stopped models to ensure they're never selected
+                output_loss[prs_no, model_no] = float('inf')
+                output_r2[prs_no, model_no] = -float('inf')  # Very poor R2
+                output_neff[prs_no, model_no] = 0.0
+            else:
+                output_loss[prs_no, model_no] = log_dict[
+                    "test_loss_pheno_" + str(prs_no) + "_alpha_" + str(alpha_i)
+                ]
+                output_r2[prs_no, model_no] = log_dict[
+                    "test_r2_pheno_" + str(prs_no) + "_alpha_" + str(alpha_i)
+                ]
+                output_neff[prs_no, model_no] = log_dict[
+                    "neff_pheno_" + str(prs_no) + "_alpha_" + str(alpha_i)
+                ]
             # for chr_no, chr in enumerate(trainer.unique_chr_map):
             #     output_r2_chr[chr_no, prs_no, model_no] = log_dict[
             #         "test_r2_pheno_" + str(prs_no) + "_alpha_" + str(alpha_i) + "_chr_" + str(chr)

@@ -146,6 +146,12 @@ def main():
         "--early_stopping_min_delta", help="Minimum improvement in validation loss to reset patience counter", type=float, default=1e-4
     )
     parser.add_argument(
+        "--warm_start", 
+        help="Enable warm start - use converged models to initialize similar alphas for faster convergence", 
+        action="store_true", 
+        default=False
+    )
+    parser.add_argument(
         "--lr",
         help="Learning rate of the optimizer",
         type=float,
