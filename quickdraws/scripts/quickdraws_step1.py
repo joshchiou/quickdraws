@@ -20,6 +20,7 @@ import argparse
 import os
 import numpy as np
 import torch
+import torch.distributed as dist
 import time
 import h5py
 import logging
@@ -51,13 +52,17 @@ def make_sure_path_exists(path):
 
 
 def main():
-
+            
     overall_st = time.time()
     ######      Setting the random seeds         ######
-    np.random.seed(2)
-    torch.manual_seed(2)
+    # Set base random seeds consistently across all processes
+    # This ensures reproducible initialization while allowing
+    # DDP to naturally diverge through different data partitions
+    base_seed = 2
+    np.random.seed(base_seed)
+    torch.manual_seed(base_seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(2)
+        torch.cuda.manual_seed_all(base_seed)
 
     ######      Parsing the input arguments       ######
     parser = argparse.ArgumentParser()
@@ -176,7 +181,7 @@ def main():
         default="false",
     )
     parser.add_argument(
-        "--batch_size", help="Batch size of the dataloader", type=int, default=128
+        "--batch_size", help="Batch size of the dataloader per GPU (will be scaled automatically for DDP)", type=int, default=128
     )
     parser.add_argument(
         "--forward_passes", help="Number of forward passes in blr", type=int, default=1
@@ -233,6 +238,40 @@ def main():
         default=False,
     )
     parser.add_argument("--chunksize", help="Chunk size of the HDF5 file, higher usually leads to faster conversion but might require more RAM, should be divisible by 128", type=int, default=8192)
+    
+    ## DDP arguments
+    ddp_group = parser.add_argument_group("Distributed Data Parallel")
+    ddp_group.add_argument(
+        "--ddp",
+        help="Enable Distributed Data Parallel training",
+        action="store_true",
+        default=False,
+    )
+    ddp_group.add_argument(
+        "--local_rank",
+        help="Local rank for DDP (automatically set by torchrun)",
+        type=int,
+        default=-1,
+    )
+    ddp_group.add_argument(
+        "--world_size",
+        help="Total number of processes for DDP",
+        type=int,
+        default=1,
+    )
+    ddp_group.add_argument(
+        "--master_addr",
+        help="Master address for DDP",
+        type=str,
+        default="localhost",
+    )
+    ddp_group.add_argument(
+        "--master_port",
+        help="Master port for DDP",
+        type=str,
+        default="12355",
+    )
+    
     ## wandb arguments
     wandb_group = parser.add_argument_group("WandB")
     wandb_mode = wandb_group.add_mutually_exclusive_group()
@@ -257,45 +296,144 @@ def main():
     )
     args = parser.parse_args()
 
+    ######      DDP initialization                #######
+    if args.ddp:
+        # Initialize distributed training
+        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ and 'LOCAL_RANK' in os.environ:
+            # torchrun environment - use automatic initialization
+            args.rank = int(os.environ['RANK'])
+            args.world_size = int(os.environ['WORLD_SIZE'])
+            args.local_rank = int(os.environ['LOCAL_RANK'])
+            
+            # Set device
+            torch.cuda.set_device(args.local_rank)
+            device = torch.device(f'cuda:{args.local_rank}')
+            
+            # Initialize process group with automatic rendezvous from torchrun
+            dist.init_process_group(backend='nccl')
+            
+        elif 'SLURM_PROCID' in os.environ:
+            # For SLURM environments (srun without torchrun)
+            args.rank = int(os.environ['SLURM_PROCID'])
+            args.world_size = int(os.environ['SLURM_NTASKS'])
+            
+            # Calculate local rank based on tasks per node
+            if 'SLURM_LOCALID' in os.environ:
+                args.local_rank = int(os.environ['SLURM_LOCALID'])
+            else:
+                # Fallback: assume equal distribution of tasks across nodes
+                tasks_per_node = int(os.environ.get('SLURM_NTASKS_PER_NODE', '1'))
+                args.local_rank = args.rank % tasks_per_node
+            
+            # Get master node address
+            if 'SLURM_LAUNCH_NODE_IPADDR' in os.environ:
+                master_addr = os.environ['SLURM_LAUNCH_NODE_IPADDR']
+            elif 'SLURM_NODELIST' in os.environ:
+                # Parse first node from nodelist
+                import subprocess
+                result = subprocess.run(['scontrol', 'show', 'hostnames', os.environ['SLURM_NODELIST']], 
+                                      capture_output=True, text=True)
+                master_addr = result.stdout.strip().split('\n')[0]
+            else:
+                master_addr = args.master_addr
+            
+            # Set device
+            if torch.cuda.is_available():
+                torch.cuda.set_device(args.local_rank)
+                device = torch.device(f'cuda:{args.local_rank}')
+            else:
+                device = torch.device('cpu')
+            
+            # Initialize process group with manual TCP init for SLURM
+            dist.init_process_group(
+                backend='nccl' if torch.cuda.is_available() else 'gloo',
+                init_method=f'tcp://{master_addr}:{args.master_port}',
+                world_size=args.world_size,
+                rank=args.rank
+            )
+        else:
+            # Fallback for manual setup
+            args.rank = 0
+            args.world_size = 1
+            args.local_rank = 0
+            
+            # Set device
+            if torch.cuda.is_available():
+                torch.cuda.set_device(args.local_rank)
+                device = torch.device(f'cuda:{args.local_rank}')
+            else:
+                device = torch.device('cpu')
+            
+            # Initialize process group with manual TCP init
+            dist.init_process_group(
+                backend='nccl' if torch.cuda.is_available() else 'gloo',
+                init_method=f'tcp://{args.master_addr}:{args.master_port}',
+                world_size=args.world_size,
+                rank=args.rank
+            )
+        
+        # Ensure all processes sync
+        dist.barrier()
+        
+        # Optional: Set rank-specific seeds for better randomness
+        # Uncomment if you want each rank to have different random streams
+        # rank_seed = base_seed + args.rank
+        # torch.manual_seed(rank_seed)
+        # np.random.seed(rank_seed)
+        # if torch.cuda.is_available():
+        #     torch.cuda.manual_seed_all(rank_seed)
+    else:
+        args.rank = 0
+        args.world_size = 1
+        args.local_rank = 0
+
     ######      Logging setup                    #######
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(message)s",
-        handlers=[
-            logging.FileHandler(args.out + ".log", "w", "utf-8"),
-            logging.StreamHandler()
-        ]
-    )
+    if args.rank == 0:  # Only main process logs
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(message)s",
+            handlers=[
+                logging.FileHandler(args.out + ".log", "w", "utf-8"),
+                logging.StreamHandler()
+            ]
+        )
 
-    logging.info(get_copyright_string())
-    logging.info("")
-    logging.info("Logs saved in: " + str(args.out + ".log"))
-    logging.info("")
+        logging.info(get_copyright_string())
+        logging.info("")
+        logging.info("Logs saved in: " + str(args.out + ".log"))
+        logging.info("")
 
-    logging.info("Options in effect: ")
-    for arg in vars(args):
-        logging.info('     {}: {}'.format(arg, getattr(args, arg)))
+        logging.info("Options in effect: ")
+        for arg in vars(args):
+            logging.info('     {}: {}'.format(arg, getattr(args, arg)))
 
-    logging.info("")
+        logging.info("")
+    else:
+        # Disable logging for non-main processes
+        logging.basicConfig(level=logging.CRITICAL)
 
     ######      Preprocessing the phenotypes      ######
     st = time.time()
-    logging.info("#### Start Time: " + str(datetime.today().strftime('%Y-%m-%d %H:%M:%S')) + " ####")
-    logging.info("")
+    if args.rank == 0:
+        logging.info("#### Start Time: " + str(datetime.today().strftime('%Y-%m-%d %H:%M:%S')) + " ####")
+        logging.info("")
 
     warnings.simplefilter("ignore")
 
     make_sure_path_exists(args.out)
 
     if args.out_step0 is not None:
-        logging.info("#### Step 1a. Using preprocessed phenotype and hdf5 files ####")
+        if args.rank == 0:
+            logging.info("#### Step 1a. Using preprocessed phenotype and hdf5 files ####")
         rhe_out = args.out_step0
         hdf5_filename = args.out_step0 + ".hdf5"
         sample_indices = np.array(h5py.File(hdf5_filename, "r")["sample_indices"])
-        logging.info("#### Step 1a. Done in " + str(time.time() - st) + " secs ####")
-        logging.info("")
+        if args.rank == 0:
+            logging.info("#### Step 1a. Done in " + str(time.time() - st) + " secs ####")
+            logging.info("")
     else:
-        logging.info("#### Step 1a. Preprocessing the phenotypes and converting bed to hdf5 ####")
+        if args.rank == 0:
+            logging.info("#### Step 1a. Preprocessing the phenotypes and converting bed to hdf5 ####")
         rhe_out = args.out
         Traits, covar_effects, sample_indices = preprocess_phenotypes(
             args.phenoFile, args.covarFile, args.bed, args.keepFile, args.binary, args.hdf5, args.phen_thres
@@ -310,13 +448,15 @@ def main():
             args.hdf5,
             args.chunksize
         )
-        logging.info("#### Step 1a. Done in " + str(time.time() - st) + " secs ####")
-        logging.info("")
+        if args.rank == 0:
+            logging.info("#### Step 1a. Done in " + str(time.time() - st) + " secs ####")
+            logging.info("")
 
     ######      Run RHE-MC for h2 estimation      ######
     if args.h2_file is None and not args.h2_grid:
         st = time.time()
-        logging.info("#### Step 1b. Calculating heritability estimates using RHE ####")
+        if args.rank == 0:
+            logging.info("#### Step 1b. Calculating heritability estimates using RHE ####")
         args.annot = args.out + ".maf2_ld4.annot"
         MakeAnnotation(
             args.bed,
@@ -339,65 +479,88 @@ def main():
             args.rhe_random_vectors,
             args.rhe_jn
         )
-        logging.info("#### Step 1b. Done in " + str(time.time() - st) + " secs ####")
-        logging.info("")
+        if args.rank == 0:
+            logging.info("#### Step 1b. Done in " + str(time.time() - st) + " secs ####")
+            logging.info("")
     elif args.h2_file is not None:
         st = time.time()
-        logging.info("#### Step 1b. Loading heritability estimates from: " + str(args.h2_file) + " ####")
-        logging.info("")
+        if args.rank == 0:
+            logging.info("#### Step 1b. Loading heritability estimates from: " + str(args.h2_file) + " ####")
+            logging.info("")
         VC = np.loadtxt(args.h2_file)
-        logging.info("#### Step 1b. Done in " + str(time.time() - st) + " secs ####")
-        logging.info("")
+        if args.rank == 0:
+            logging.info("#### Step 1b. Done in " + str(time.time() - st) + " secs ####")
+            logging.info("")
     else:
         st = time.time()
-        logging.info("#### Step 1b. Using h2_grid and performing a grid search in BLR ####")
-        logging.info("")
+        if args.rank == 0:
+            logging.info("#### Step 1b. Using h2_grid and performing a grid search in BLR ####")
+            logging.info("")
         VC = None
-        logging.info("#### Step 1b. Done in " + str(time.time() - st) + " secs ####")
-        logging.info("")
+        if args.rank == 0:
+            logging.info("#### Step 1b. Done in " + str(time.time() - st) + " secs ####")
+            logging.info("")
 
 
     ######      Running variational inference     ######
     st = time.time()
-    logging.info("#### Step 1c. Running VI using spike and slab prior ####")
-    if torch.cuda.is_available():
-        logging.info("Using GPU to run variational inference!!")
-        logging.info("")
+    if args.rank == 0:  # Only main process logs
+        logging.info("#### Step 1c. Running VI using spike and slab prior ####")
+    
+    if args.ddp:
+        # For DDP, device was already set during initialization
+        device = torch.device(f'cuda:{args.local_rank}')
+        if args.rank == 0:
+            logging.info(f"Using DDP with {args.world_size} GPUs for variational inference!!")
+            logging.info("")
+    elif torch.cuda.is_available():
+        if args.rank == 0:
+            logging.info("Using GPU to run variational inference!!")
+            logging.info("")
         device = 'cuda' 
     elif torch.backends.mps.is_available():
-        logging.info("Using MPS to run variational inference!!")
-        logging.info("")
+        if args.rank == 0:
+            logging.info("Using MPS to run variational inference!!")
+            logging.info("")
         device = 'mps'
     else:
-        logging.info("PyTorch can not detect either CUDA or MPS. Falling back to CPU to run variational"
-                     " inference... expect very slow multiplications.")
-        logging.info("")
+        if args.rank == 0:
+            logging.info("PyTorch can not detect either CUDA or MPS. Falling back to CPU to run variational"
+                         " inference... expect very slow multiplications.")
+            logging.info("")
         device = 'cpu'
             
-    if args.kinship is None:
+    if args.kinship is None and args.rank == 0:
         logging.info("Caution: A kinship file wasn't supplied, no correction for relatives will be performed... this could lead to inflation if there are relatives in the dataset")
         logging.info("")
     
     beta = blr_spike_slab(args, VC, hdf5_filename, device)
-    logging.info("#### Step 1c. Done in " + str(time.time() - st) + " secs ####")
-    logging.info("")
+    
+    if args.ddp:
+        # Clean up DDP
+        dist.destroy_process_group()
+    
+    if args.rank == 0:  # Only main process logs and saves outputs
+        logging.info("#### Step 1c. Done in " + str(time.time() - st) + " secs ####")
+        logging.info("")
 
-    logging.info("Saved LOCO predictions per phenotype as: ")
-    with h5py.File(hdf5_filename,'r') as f:
-        pheno_names = f['pheno_names'][:]
-    with open(args.out + "_pred.list" , 'w') as f:
-        for i, pheno_name in enumerate(pheno_names):
-            f.write(pheno_name.decode() + " " + str(Path(args.out).resolve()) + "_" + str(i+1) + ".loco \n")
-            logging.info(pheno_name.decode() + " : " + str(Path(args.out).resolve()) + "_" + str(i+1) + ".loco")
-    logging.info("")
-    logging.info("LOCO prediction locations per phenotype saved as: " + str(args.out + '_pred.list'))
-    logging.info("")
+        logging.info("Saved LOCO predictions per phenotype as: ")
+        with h5py.File(hdf5_filename,'r') as f:
+            pheno_names = f['pheno_names'][:]
+        with open(args.out + "_pred.list" , 'w') as f:
+            for i, pheno_name in enumerate(pheno_names):
+                f.write(pheno_name.decode() + " " + str(Path(args.out).resolve()) + "_" + str(i+1) + ".loco \n")
+                logging.info(pheno_name.decode() + " : " + str(Path(args.out).resolve()) + "_" + str(i+1) + ".loco")
+        logging.info("")
+        logging.info("LOCO prediction locations per phenotype saved as: " + str(args.out + '_pred.list'))
+        logging.info("")
 
-    logging.info("Saved h2 estimates per phenotype as: " + str(args.out + '.h2'))
-    logging.info("")
-    logging.info("Saved sparsity estimates per phenotype as: " + str(args.out + '.alpha'))
-    logging.info("")
-    if args.predBetasFlag:
+        logging.info("Saved h2 estimates per phenotype as: " + str(args.out + '.h2'))
+        logging.info("")
+        logging.info("Saved sparsity estimates per phenotype as: " + str(args.out + '.alpha'))
+        logging.info("")
+        
+    if args.predBetasFlag and args.rank == 0:
         snp_on_disk = Bed(args.bed, count_A1=True)
         if args.modelSnps is None:
             total_snps = snp_on_disk.sid_count
@@ -428,19 +591,24 @@ def main():
         )
         bim = bim[['CHR','SNP','A1','A2']]
         df = pd.merge(df, bim, on=['CHR','SNP'])
-        print(df.shape)
+        if args.rank == 0:
+            print(df.shape)
+        with h5py.File(hdf5_filename,'r') as f:
+            pheno_names = f['pheno_names'][:]
         for d, pheno_name in enumerate(pheno_names):
             df['BETA'] = beta[d]
             df.to_csv(args.out + '_' + pheno_name.decode() + '.posterior_betas', sep='\t', index=None, na_rep='NA')
-        logging.info("Saved prediction posterior betas per phenotype as: ")
-        for i, pheno_name in enumerate(pheno_names):
-            logging.info(pheno_name.decode() + " : " + str(Path(args.out).resolve()) + "_" + pheno_name.decode() + ".posterior_betas")
-        logging.info("")
+        if args.rank == 0:
+            logging.info("Saved prediction posterior betas per phenotype as: ")
+            for i, pheno_name in enumerate(pheno_names):
+                logging.info(pheno_name.decode() + " : " + str(Path(args.out).resolve()) + "_" + pheno_name.decode() + ".posterior_betas")
+            logging.info("")
 
-    logging.info("#### Step 1 total Time: " + str(time.time() - overall_st) + " secs ####")
-    logging.info("")
-    logging.info("#### End Time: " + str(datetime.today().strftime('%Y-%m-%d %H:%M:%S')) + " ####")
-    logging.info("")
+    if args.rank == 0:
+        logging.info("#### Step 1 total Time: " + str(time.time() - overall_st) + " secs ####")
+        logging.info("")
+        logging.info("#### End Time: " + str(datetime.today().strftime('%Y-%m-%d %H:%M:%S')) + " ####")
+        logging.info("")
 
 
 if __name__ == "__main__":

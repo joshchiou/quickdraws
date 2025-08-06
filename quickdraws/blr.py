@@ -40,6 +40,9 @@ import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from joblib import Parallel, delayed
 
 import gc
@@ -157,11 +160,11 @@ class BBB_Linear_spike_slab(nn.Module):
             spike.mul(sig1.pow(2)) + spike.mul(mu1.pow(2)) - mean_preactivations.pow(2)
         )
         if device.type == 'cuda':
-            eps = torch.cuda.FloatTensor(x.shape[0], mu1.shape[0]).normal_()
+            eps = torch.empty(x.shape[0], mu1.shape[0], device=device).normal_()
         elif device.type == 'mps':
             eps = torch.randn(x.shape[0], mu1.shape[0], device=device)
         else:
-            eps = torch.FloatTensor(x.shape[0], mu1.shape[0]).normal_()
+            eps = torch.empty(x.shape[0], mu1.shape[0], device=device).normal_()
         
         mean_ = F.linear(x, mean_preactivations)
         var_ = eps * torch.sqrt(F.linear(x.pow(2), var_preactivations))
@@ -376,6 +379,10 @@ class Trainer:
         predBetasFlag=False
     ):
         self.args = args
+        
+        # Handle distributed training setup first
+        self.is_distributed = hasattr(args, 'ddp') and args.ddp
+        
         '''
         The dimensionality of h2 is checked. If h2 is two-dimensional, it is summed across one axis to reduce it to a 
         one-dimensional array. This simplification might be applied when h2 contains SNP-specific heritability estimates, 
@@ -398,8 +405,15 @@ class Trainer:
         self.df_iid_fid = self.df_iid_fid['FID'].str.cat(self.df_iid_fid['IID'].values,sep='_')
         '''
         Determines how often the validation should be performed during training. 
+        For distributed training, reduce validation frequency to minimize communication overhead.
         '''
-        self.validate_every = validate_every if validate_every > 0 else 1
+        if self.is_distributed and validate_every > 0:
+            # Reduce validation frequency for DDP to minimize communication overhead
+            self.validate_every = max(validate_every * 2, 5)
+            if args.rank == 0:
+                logging.info(f"DDP: Reduced validation frequency to every {self.validate_every} steps")
+        else:
+            self.validate_every = validate_every if validate_every > 0 else 1
         self.never_validate = validate_every < 0
         '''
         If provided, this indicates the chromosome mapping for each genetic variant in the dataset. 
@@ -484,21 +498,88 @@ class Trainer:
         )
         ## TODO: write a masked BCE loss function
         self.wandb_step = 1
+        
+        # Create samplers for distributed training
+        if self.is_distributed:
+            self.train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=args.world_size,
+                rank=args.rank,
+                shuffle=True
+            )
+            self.test_sampler = DistributedSampler(
+                test_dataset,
+                num_replicas=args.world_size,
+                rank=args.rank,
+                shuffle=False
+            )
+        else:
+            self.train_sampler = None
+            self.test_sampler = None
+        
+        # Optimize batch size for distributed training
+        effective_batch_size = self.args.batch_size
+        if self.is_distributed:
+            # Keep the same total effective batch size across all GPUs
+            effective_batch_size = max(1, self.args.batch_size // args.world_size)
+            if args.rank == 0:
+                logging.info(f"DDP: Using batch size {effective_batch_size} per GPU "
+                           f"(total effective batch size: {effective_batch_size * args.world_size})")
+        
+        # Optimize num_workers for distributed training
+        num_workers = self.args.num_workers
+        if self.is_distributed:
+            # Reduce workers per process to avoid oversubscription
+            num_workers = max(1, self.args.num_workers // args.world_size)
+        
         self.train_dataloader = torch.utils.data.DataLoader(
             train_dataset,
-            shuffle=True,
-            batch_size=self.args.batch_size,
-            num_workers=self.args.num_workers,
-            pin_memory=self.args.num_workers > 0,
+            batch_size=effective_batch_size,
+            sampler=self.train_sampler,
+            shuffle=(self.train_sampler is None),  # Only shuffle if not using DistributedSampler
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available() and num_workers > 0,
+            persistent_workers=num_workers > 0,  # Keep workers alive between epochs
+            drop_last=True,  # Ensure consistent batch sizes across GPUs
         )
         self.test_dataloader = torch.utils.data.DataLoader(
             test_dataset,
+            batch_size=effective_batch_size,
+            sampler=self.test_sampler,
             shuffle=False,
-            batch_size=self.args.batch_size,
-            num_workers=self.args.num_workers,
-            pin_memory=self.args.num_workers > 0,
+            num_workers=num_workers,
+            pin_memory=torch.cuda.is_available() and num_workers > 0,
+            persistent_workers=num_workers > 0,
+            drop_last=False,  # Don't drop last batch for validation
         )
         self.pheno_names = train_dataset.pheno_names
+
+    def set_epoch(self, epoch):
+        """Set epoch for distributed sampler to ensure proper shuffling"""
+        if self.is_distributed and self.train_sampler is not None:
+            self.train_sampler.set_epoch(epoch)
+    
+    def _get_model_module(self, model):
+        """Get the actual model module (unwrap DDP if necessary)"""
+        if isinstance(model, DDP):
+            return model.module
+        return model
+    
+    def _synchronize_metrics(self, metrics_dict):
+        """Synchronize metrics across all processes for DDP"""
+        if not self.is_distributed:
+            return metrics_dict
+        
+        # Convert metrics to tensors and average across processes
+        synchronized_metrics = {}
+        for key, value in metrics_dict.items():
+            if isinstance(value, (int, float)):
+                tensor_value = torch.tensor(value, device=self.device)
+                dist.all_reduce(tensor_value, op=dist.ReduceOp.SUM)
+                synchronized_metrics[key] = (tensor_value / dist.get_world_size()).item()
+            else:
+                synchronized_metrics[key] = value
+        return synchronized_metrics
 
     '''
     These functions compute the MSE and BCE losses, respectively, while ignoring NaN values in the labels and predictions. 
@@ -607,6 +688,24 @@ class Trainer:
                     preds_arr[model_no].extend(preds.cpu().numpy().tolist())
                     labels_arr[model_no].extend(label.cpu().numpy().tolist())
 
+            if self.is_distributed:
+                # Gather results from all processes
+                gathered_preds_obj = [None for _ in range(dist.get_world_size())]
+                dist.all_gather_object(gathered_preds_obj, preds_arr)
+                gathered_labels_obj = [None for _ in range(dist.get_world_size())]
+                dist.all_gather_object(gathered_labels_obj, labels_arr)
+
+                # Concatenate results on all processes to ensure consistency
+                preds_arr_cat = [[] for _ in range(len(self.model_list))]
+                labels_arr_cat = [[] for _ in range(len(self.model_list))]
+                for model_no in range(len(self.model_list)):
+                    for rank_preds in gathered_preds_obj:
+                        preds_arr_cat[model_no].extend(rank_preds[model_no])
+                    for rank_labels in gathered_labels_obj:
+                        labels_arr_cat[model_no].extend(rank_labels[model_no])
+                preds_arr = preds_arr_cat
+                labels_arr = labels_arr_cat
+
             test_loss = []
             for model_no in range(len(self.model_list)):
                 test_loss.append(
@@ -688,8 +787,9 @@ class Trainer:
                 for model_no, model in enumerate(self.model_list):
                     chr_no = model_no % self.num_chr
                     phen_no = self.pheno_for_model[model_no // self.num_chr]
-                    spike = torch.clamp(model.sc1.spike1, 1e-6, 1.0 - 1e-6)
-                    mu = model.fc1.weight
+                    model_module = self._get_model_module(model)
+                    spike = torch.clamp(model_module.sc1.spike1, 1e-6, 1.0 - 1e-6)
+                    mu = model_module.fc1.weight
                     beta = spike.mul(mu)
                     preds = (input[:, self.chr_map != self.unique_chr_map[chr_no]]) @ (
                         beta.T
@@ -731,14 +831,29 @@ class Trainer:
         '''
         Main training function for whole-genome regression
         '''
-        logging.info("Epoch: " + str(epoch+1) + "/" + str(self.args.alpha_search_epochs))
-        for input, covar_effect, label in self.train_dataloader:
+        # Set epoch for distributed sampler
+        self.set_epoch(epoch)
+        
+        rank = getattr(self.args, 'rank', 0)
+        if rank == 0:  # Only main process logs
+            logging.info("Epoch: " + str(epoch+1) + "/" + str(self.args.alpha_search_epochs))
+        
+        epoch_start_time = time.time()
+        data_time = 0
+        forward_time = 0
+        backward_time = 0
+        
+        for batch_idx, (input, covar_effect, label) in enumerate(self.train_dataloader):
+            batch_start_time = time.time()
+            
             log_dict = {}
             input, covar_effect, label = (
-                input.to(self.device),
-                covar_effect.to(self.device),
-                label.to(self.device),
+                input.to(self.device, non_blocking=True),
+                covar_effect.to(self.device, non_blocking=True),
+                label.to(self.device, non_blocking=True),
             )
+            data_time += time.time() - batch_start_time
+            
             mask = ~(torch.isnan(label).all(axis=1))  ## remove samples with all nans
             input, covar_effect, label = input[mask], covar_effect[mask], label[mask]
             h2 = self.h2.unsqueeze(0).unsqueeze(0).repeat(2, label.shape[0], 1)
@@ -748,6 +863,8 @@ class Trainer:
             mse_loss_arr = []
             reg_loss_arr = []
             total_loss_arr = []
+            
+            forward_start_time = time.time()
             for model_no, model in enumerate(self.model_list):
                 preds, reg_loss = model(input, covar_effect_4x, binary=self.args.binary)
                 mse_loss = self.loss_func(preds, label_4x, h2*(1-var_covar_effect)+var_covar_effect)
@@ -768,10 +885,17 @@ class Trainer:
                 mse_loss_arr.append(mse_loss.item())
                 reg_loss_arr.append(reg_loss.item())
                 total_loss_arr.append(loss.item())
+                
+                forward_time += time.time() - forward_start_time
+                backward_start_time = time.time()
+                
                 ## Backprop ##
                 self.optimizer_list[model_no].zero_grad(set_to_none=True)
                 loss.backward()
                 self.optimizer_list[model_no].step()
+                
+                backward_time += time.time() - backward_start_time
+                forward_start_time = time.time()  # Reset for next model
 
             ### Logging everything ###
             if (
@@ -799,38 +923,48 @@ class Trainer:
                         log_dict["train_total_loss_" + str(alpha)] = total_loss_arr[
                             model_no
                         ] / len(label)
+                        model_module = self._get_model_module(self.model_list[model_no])
                         log_dict["mean_sigma_" + str(alpha)] = torch.mean(
-                            F.relu(self.model_list[model_no].sc1.sigma1)
+                            F.relu(model_module.sc1.sigma1)
                         ).cpu()
                         log_dict["mean_slab_" + str(alpha)] = torch.mean(
                             torch.clamp(
-                                self.model_list[model_no].sc1.spike1, 1e-12, 1 - 1e-12
+                                model_module.sc1.spike1, 1e-12, 1 - 1e-12
                             )
                         ).cpu()
                         grad_norm = 0
+                        model_module = self._get_model_module(self.model_list[model_no])
                         for p in list(
                             filter(
                                 lambda p: p.grad is not None,
-                                self.model_list[model_no].parameters(),
+                                model_module.parameters(),
                             )
                         ):
                             grad_norm += p.grad.data.norm(2).item()
                         log_dict["grad_norm_" + str(alpha)] = grad_norm
 
-                if not self.args.wandb_mode == "disabled":
+                # Only log to wandb on rank 0 for distributed training
+                rank = getattr(self.args, 'rank', 0)
+                if not self.args.wandb_mode == "disabled" and rank == 0:
                     wandb.log(log_dict, step=self.wandb_step)
             self.wandb_step += 1
 
         if hasattr(self, "scheduler_list"):
             for scheduler in self.scheduler_list:
                 scheduler.step(epoch=epoch)
+        
         return log_dict
 
     def train_epoch_loco(self, epoch):
         '''
         Main training function for the LOCO regression
         '''
-        logging.info("Epoch: " + str(epoch+1) + "/" + str(self.args.num_epochs))
+        # Set epoch for distributed sampler
+        self.set_epoch(epoch)
+        
+        rank = getattr(self.args, 'rank', 0)
+        if rank == 0:  # Only main process logs
+            logging.info("Epoch: " + str(epoch+1) + "/" + str(self.args.num_epochs))
         for input, covar_effect, label in self.train_dataloader:
             # st = time.time()
             input, covar_effect, label = (
@@ -898,7 +1032,8 @@ def initialize_model(
     chr_map=None,
     mu=None,
     spike=None,
-    predBetasFlag=False
+    predBetasFlag=False,
+    args=None  # Added for DDP support
 ):
     '''
      If chr_map is provided, the unique chromosomes are identified. 
@@ -1000,7 +1135,19 @@ def initialize_model(
                 )
                 model = model.to(device)
                 if device == 'cpu':
-                    model = torch.compile(model) 
+                    model = torch.compile(model)
+                
+                # Wrap with DDP if distributed training is enabled
+                if args and hasattr(args, 'ddp') and args.ddp:
+                    # Configure DDP for better performance
+                    model = DDP(
+                        model, 
+                        device_ids=[args.local_rank], 
+                        output_device=args.local_rank,
+                        find_unused_parameters=False,  # Set to False for better performance if all parameters are used
+                        gradient_as_bucket_view=True   # More memory efficient
+                    )
+                
                 model_list.append(model)
         else:
             model = Model(
@@ -1016,6 +1163,18 @@ def initialize_model(
             model = model.to(device)
             if device == 'cpu':
                 model = torch.compile(model)
+            
+            # Wrap with DDP if distributed training is enabled
+            if args and hasattr(args, 'ddp') and args.ddp:
+                # Configure DDP for better performance
+                model = DDP(
+                    model, 
+                    device_ids=[args.local_rank], 
+                    output_device=args.local_rank,
+                    find_unused_parameters=False,  # Set to False for better performance if all parameters are used
+                    gradient_as_bucket_view=True   # More memory efficient
+                )
+            
             model_list.append(model)
     '''The function returns the list of initialized models (model_list), ready for training or inference.'''
     return model_list
@@ -1024,6 +1183,11 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
     '''
     The hyperparam_search function performs sparsity search
     '''
+    # Handle distributed training setup
+    is_distributed = hasattr(args, 'ddp') and args.ddp
+    rank = getattr(args, 'rank', 0)
+    world_size = getattr(args, 'world_size', 1)
+    
     # Define datasets and dataloaders
     # logging.info("Loading the data to RAM..")
     start_time = time.time()
@@ -1056,6 +1220,7 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
         dim_out,
         torch.sum(~(torch.isnan(train_dataset.output).all(axis=1))),
         device,
+        args=args  # Pass args for DDP support
     )
     # Define trainer for training the model
     logging.info("Starting search for optimal alpha...")
@@ -1182,16 +1347,16 @@ def hyperparam_search(args, alpha, h2, train_dataset, test_dataset, device="cuda
     mu_list = torch.zeros((dim_out, len(std_genotype))).to(device)
     spike_list = torch.zeros((dim_out, len(std_genotype))).to(device)
     for prs_no in range(dim_out):
+        model_module = trainer._get_model_module(trainer.model_list[best_alpha[prs_no]])
         mu = (
-            trainer.model_list[best_alpha[prs_no]]
-            .fc1.weight[prs_no]
+            model_module.fc1.weight[prs_no]
             # .cpu()
             # .detach()
             # .numpy()
         )
         spike = (
             torch.clamp(
-                trainer.model_list[best_alpha[prs_no]].sc1.spike1[prs_no],
+                model_module.sc1.spike1[prs_no],
                 1e-6,
                 1.0 - 1e-6,
             )
@@ -1229,7 +1394,13 @@ def blr_spike_slab(args, h2, hdf5_filename, device="cuda"):
     '''
     overall_start_time = time.time()
     torch.set_num_threads(get_cpu_count())  ## speedify computation on CPU
-    if not args.wandb_mode == "disabled":
+    
+    # Handle distributed training setup
+    is_distributed = hasattr(args, 'ddp') and args.ddp
+    rank = getattr(args, 'rank', 0)
+    world_size = getattr(args, 'world_size', 1)
+    
+    if not args.wandb_mode == "disabled" and rank == 0:  # Only main process logs to wandb
         logging.info("Initializing wandb to log the progress..")
         wandb.init(
             mode=args.wandb_mode,
@@ -1405,7 +1576,8 @@ def blr_spike_slab(args, h2, hdf5_filename, device="cuda"):
         chr_map,
         mu=mu,
         spike=spike,
-        predBetasFlag=args.predBetasFlag
+        predBetasFlag=args.predBetasFlag,
+        args=args  # Pass args for DDP support
     )
     del mu
     del spike
@@ -1460,18 +1632,19 @@ def blr_spike_slab(args, h2, hdf5_filename, device="cuda"):
 
     ## Calculate estimates
 
-    logging.info("Done fitting the model in: " + str(time.time() - start_time) + " secs")
+    if rank == 0:
+        logging.info("Done fitting the model in: " + str(time.time() - start_time) + " secs")
 
-    logging.info("Saving exact LOCO estimates...")
-    start_time = time.time()
-    trainer.save_exact_blup_estimates(
-        np.argmax(output_r2_subset, axis=1), args.out, r2_best, correction_relatives=correction_relatives
-    )
-    logging.info(
-        "Done writing exact LOCO estimates in: "
-        + str(time.time() - start_time)
-        + " secs"
-    )
+        logging.info("Saving exact LOCO estimates...")
+        start_time = time.time()
+        trainer.save_exact_blup_estimates(
+            np.argmax(output_r2_subset, axis=1), args.out, r2_best, correction_relatives=correction_relatives
+        )
+        logging.info(
+            "Done writing exact LOCO estimates in: "
+            + str(time.time() - start_time)
+            + " secs"
+        )
 
     '''
     If args.predBetasFlag is true, calculates posterior Betas for the entire dataset 
@@ -1481,7 +1654,7 @@ def blr_spike_slab(args, h2, hdf5_filename, device="cuda"):
     Calculation of Betas: The posterior Betas are computed as the product of mu and spike parameters.
     '''
 
-    if args.predBetasFlag:
+    if args.predBetasFlag and rank == 0:  # Only main process calculates betas
         logging.info("Calculating the posterior prediciton betas using the entire data...")
         dim_out = full_dataset.output.shape[1]
         best_alpha = np.argmax(output_r2_subset, axis=1)
@@ -1489,16 +1662,17 @@ def blr_spike_slab(args, h2, hdf5_filename, device="cuda"):
         spike_list = np.zeros((dim_out, len(std_genotype)))
         for prs_no in range(dim_out):
             output_no = np.where(np.where(best_alpha == best_alpha[prs_no])[0] == prs_no)[0][0]
+            model = trainer.model_list[best_alpha[prs_no]*num_chr + num_chr - 1]
+            model_module = trainer._get_model_module(model)
             mu = (
-                trainer.model_list[best_alpha[prs_no]*num_chr + num_chr - 1]
-                .fc1.weight[output_no]
+                model_module.fc1.weight[output_no]
                 .cpu()
                 .detach()
                 .numpy()
             )
             spike = (
                 torch.clamp(
-                    trainer.model_list[best_alpha[prs_no]*num_chr + num_chr - 1].sc1.spike1[output_no],
+                    model_module.sc1.spike1[output_no],
                     1e-6,
                     1.0 - 1e-6,
                 )
@@ -1513,9 +1687,15 @@ def blr_spike_slab(args, h2, hdf5_filename, device="cuda"):
     else:
         beta = None 
 
-    wandb.finish()
+    if not args.wandb_mode == "disabled" and rank == 0:
+        wandb.finish()
+    
     if args.lowmem:
         full_dataset.close_hdf5()
+    
+    # Ensure all processes finish before returning
+    if is_distributed:
+        dist.barrier()
     
     return beta
 
