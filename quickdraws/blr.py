@@ -1183,11 +1183,6 @@ def initialize_model(
                 )
                 model = model.to(device)
                 
-                # Compile model for better performance on both CPU and GPU
-                # torch.compile provides 10-30% speedup without precision changes
-                if hasattr(torch, 'compile'):
-                    model = torch.compile(model, mode='default')  # Balanced optimization
-                
                 # Wrap with DDP if distributed training is enabled
                 if args and hasattr(args, 'ddp') and args.ddp:
                     # Configure DDP for better performance
@@ -1212,11 +1207,6 @@ def initialize_model(
                 spike=spike,
             )
             model = model.to(device)
-            
-            # Compile model for better performance on both CPU and GPU
-            # torch.compile provides 10-30% speedup without precision changes
-            if hasattr(torch, 'compile'):
-                model = torch.compile(model, mode='default')  # Balanced optimization
             
             # Wrap with DDP if distributed training is enabled
             if args and hasattr(args, 'ddp') and args.ddp:
