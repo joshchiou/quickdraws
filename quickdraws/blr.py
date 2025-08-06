@@ -1089,23 +1089,29 @@ def initialize_model(
             source_model = model_list[source_alpha_no]
             current_model = model_list[alpha_no]
             
-            # Transfer fc1 weights (mu parameters) directly
-            current_model.fc1.weight.data = source_model.fc1.weight.data.clone()
+            # Get the device of the current model (target device)
+            current_device = next(current_model.parameters()).device
+            
+            # Transfer fc1 weights (mu parameters) directly, ensuring device compatibility
+            current_model.fc1.weight.data = source_model.fc1.weight.data.clone().to(current_device)
             
             # Adapt spike parameters based on sparsity ratio
             sparsity_ratio = current_alpha / source_alpha
             
             with torch.no_grad():
+                # Move source spike data to current device for computation
+                source_spike = source_model.sc1.spike1.data.to(current_device)
+                
                 if current_alpha > source_alpha:  # More sparse target
                     # Reduce spike values to increase sparsity
                     adapted_spike = torch.clamp(
-                        source_model.sc1.spike1.data / sparsity_ratio,
+                        source_spike / sparsity_ratio,
                         1e-6, 1.0 - 1e-6
                     )
                 else:  # Less sparse target
                     # Increase spike values to reduce sparsity  
                     adapted_spike = torch.clamp(
-                        source_model.sc1.spike1.data * (1.0 / sparsity_ratio),
+                        source_spike * (1.0 / sparsity_ratio),
                         1e-6, 1.0 - 1e-6
                     )
                 
