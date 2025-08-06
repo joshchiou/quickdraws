@@ -113,8 +113,9 @@ class BBB_Linear_spike_slab(nn.Module):
         self.num_samples = num_samples
         self.alpha = alpha
         self.c = 2.0
-        self.prior_var = prior_sig**2
-        self.log_prior_var = torch.log(self.prior_var)
+        # Register prior_var and log_prior_var as buffers so they move with the model
+        self.register_buffer('prior_var', prior_sig**2)
+        self.register_buffer('log_prior_var', torch.log(prior_sig**2))
         self.sigma1 = nn.Parameter(prior_sig)
 
     def forward(self, x, mu1, only_output=False, test=False):
@@ -129,6 +130,10 @@ class BBB_Linear_spike_slab(nn.Module):
         if only_output:
             return out, 0
 
+        # Since prior_var and log_prior_var are now buffers, they're automatically on the right device
+        # Create alpha tensor on the same device as mu1
+        alpha_tensor = torch.tensor(self.alpha, device=mu1.device, dtype=mu1.dtype)
+
         sig1_2 = sig1.pow(2)
         logvar = torch.log(sig1_2)
         KL_div = -0.5 * torch.sum(
@@ -140,8 +145,8 @@ class BBB_Linear_spike_slab(nn.Module):
                 - sig1_2 / self.prior_var
             )
         ) + torch.sum(
-            (1 - spike).mul(torch.log((1 - spike) / (1 - self.alpha)))
-            + spike.mul(torch.log(spike / self.alpha))
+            (1 - spike).mul(torch.log((1 - spike) / (1 - alpha_tensor)))
+            + spike.mul(torch.log(spike / alpha_tensor))
         )
         return out, KL_div / self.num_samples
 
@@ -161,7 +166,8 @@ class BBB_Linear_spike_slab(nn.Module):
         elif device.type == 'mps':
             eps = torch.randn(x.shape[0], mu1.shape[0], device=device)
         else:
-            eps = torch.FloatTensor(x.shape[0], mu1.shape[0]).normal_()
+            # For CPU, create tensor on the same device as x to avoid device mismatch
+            eps = torch.randn(x.shape[0], mu1.shape[0], device=x.device)
         
         mean_ = F.linear(x, mean_preactivations)
         var_ = eps * torch.sqrt(F.linear(x.pow(2), var_preactivations))
